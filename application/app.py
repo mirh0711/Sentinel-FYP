@@ -1,10 +1,10 @@
-# prototype.py  (FAST demo-ready + whole-road stats + 6-month window)
+# prototype.py  (FAST demo-ready + whole-road stats + 3-month window)
 #
 # What this version does (per your requirements):
 # - Map 1 in Tab 1 (overview, coloured, with road-class meaning text)
 # - Map 2 split into tabs by road class (service removed):
 #     residential, primary, secondary, trunk, tertiary, unclassified
-# - 6-month Sentinel window (Jan–Jun or Jul–Dec) kept
+# - 3-month Sentinel window (Jan–Mar or Apr–Jun or Jul–Sep or Oct–Dec) 
 # - Click near a road:
 #     ✅ identifies nearest road (tolerance increased + adaptive by zoom)
 #     ✅ highlights that road in RED
@@ -133,11 +133,18 @@ def region_geom_center(region_name: str):
     return geom, (center_lat, center_lon)
 
 # -----------------------------
-# Sentinel helpers (3-month / quarterly window)
+# Sentinel helpers (quarterly window)
 # -----------------------------
-def s2_composite_quarter(year: int, quarter: str, region_geom: ee.Geometry, cloud: int = 30):
+@st.cache_data(show_spinner=False)
+def s2_composite_quarter_cached(year: int, quarter: str, region_name: str, cloud: int = 30):
+    """
+    Cached quarterly composite by region+year+quarter+cloud.
+    Keeps behavior the same but avoids rebuilding composites on each click.
+    """
+    region_geom, _ = region_geom_center(region_name)
+    if region_geom is None:
+        return None
 
-    # Define quarterly date ranges
     ranges = {
         "Jan–Mar": ("01-01", "03-31"),
         "Apr–Jun": ("04-01", "06-30"),
@@ -154,15 +161,11 @@ def s2_composite_quarter(year: int, quarter: str, region_geom: ee.Geometry, clou
         .filterBounds(region_geom)
         .filterDate(start, end)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud))
-        # small bandset for speed; enough for NDVI/NDMI/SWIR_NIR
         .select(["B4", "B8", "B11"])
     )
 
-    if s2.size().getInfo() == 0:
-        return None
-
+    # Avoid size().getInfo() check to reduce sync calls.
     return s2.median().clip(region_geom)
-
 
 def s2_features(comp: ee.Image):
     ndvi = comp.normalizedDifference(["B8", "B4"]).rename("NDVI")
@@ -170,12 +173,10 @@ def s2_features(comp: ee.Image):
     swir_nir = comp.select("B11").divide(comp.select("B8")).rename("SWIR_NIR")
     return comp.addBands([ndvi, ndmi, swir_nir])
 
-
 # -----------------------------
 # Road selection + stats (whole road)
 # -----------------------------
 def _adaptive_search_m(zoom: int | None) -> int:
-    # Bigger tolerance when zoomed out
     if zoom is None:
         return 350
     if zoom <= 8:
@@ -219,14 +220,11 @@ def compute_road_stats_cached(
     if region_geom is None:
         return None
 
-    # Re-load the road by osm_id, restricted by region + class for safety
     road_fc = (
         roads_fc_for_geom(region_geom, [road_class])
         .filter(ee.Filter.eq("osm_id", osm_id))
     )
 
-    # Sometimes the attribute might be "id" depending on your dataset.
-    # If osm_id filter fails, fallback to "id".
     if road_fc.size().getInfo() == 0:
         road_fc = roads_fc_for_geom(region_geom, [road_class]).filter(ee.Filter.eq("id", osm_id))
         if road_fc.size().getInfo() == 0:
@@ -234,14 +232,12 @@ def compute_road_stats_cached(
 
     road = ee.Feature(road_fc.first())
 
-    comp = s2_composite_quarter(year, quarter, region_geom, cloud=cloud)
+    comp = s2_composite_quarter_cached(year, quarter, region_name, cloud=cloud)
     if comp is None:
         return None
 
     feat_img = s2_features(comp)
 
-    # Speed: simplify the road geometry a bit before buffering
-    # (keeps "whole road" but reduces vertex complexity)
     geom = road.geometry().simplify(simplify_m).buffer(buffer_m)
 
     stats = feat_img.reduceRegion(
@@ -271,7 +267,7 @@ def _results_key(road_class: str, region_name: str):
 # -----------------------------
 st.title("Ghana OSM roads + Sentinel-2 (prototype — demo mode)")
 st.markdown(
-    '<div class="small">Map 2 click: identify road → highlight red → show whole-road Sentinel means (cached for speed). Zoom is preserved when you click.</div>',
+    '<div class="small">Map 1: Whole Ghana OSM road network by road class. Map 2 : identify road → highlight red → show whole-road Sentinel means.</div>',
     unsafe_allow_html=True
 )
 
@@ -282,7 +278,7 @@ tabs = st.tabs(tab_names)
 # TAB 1: Map 1 Overview
 # -----------------------------
 with tabs[0]:
-    st.subheader("Map 1 — OSM roads overview (top 10 road classes, colour-coded)")
+    st.subheader("Map 1 — OSM roads overview (top 10 road classes)")
     m1 = folium.Map(location=[7.95, -1.0], zoom_start=7, tiles="cartodbpositron")
 
     roads_all = (
@@ -331,7 +327,7 @@ with tabs[0]:
     )
 
 # -----------------------------
-# TABS 2+: Map 2 per road-class  (MAP LEFT, RESULTS RIGHT)
+# TABS 2+: Map 2 per road-class
 # -----------------------------
 region_names = list_regions_ghana()
 default_region_idx = region_names.index("Greater Accra") if "Greater Accra" in region_names else 0
@@ -340,7 +336,6 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
     with tabs[i]:
         st.subheader(f"Map 2 — {road_class} roads (click to select + stats)")
 
-        # Controls (top row)
         c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
         with c1:
             region_name = st.selectbox(
@@ -362,7 +357,7 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
             quarter = st.selectbox(
                 "Quarter",
                 ["Jan–Mar", "Apr–Jun", "Jul–Sep", "Oct–Dec"],
-                key=f"quarter_{road_class}",  # ✅ FIX duplicate ID
+                key=f"quarter_{road_class}",
             )
         with c4:
             cloud = st.slider(
@@ -381,31 +376,23 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
                 key=f"scale_{road_class}",
             )
 
-        # Demo defaults (speed + stability)
-        buffer_m = 12          # corridor around the road line
-        simplify_m = 25        # simplify geometry before buffering (speed win)
+        buffer_m = 12
+        simplify_m = 25
 
-        # Load region geometry + center
         reg_geom, region_center = region_geom_center(region_name)
         if reg_geom is None:
             st.error(f"Region '{region_name}' not found or empty.")
             st.stop()
 
-        # Maintain view (zoom/center) across reruns
         vkey = _view_key(road_class, region_name)
         if vkey not in st.session_state:
             st.session_state[vkey] = {"center": region_center, "zoom": 10}
 
-        # Selected road + result keys
         skey = _sel_key(road_class, region_name)
         rkey = _results_key(road_class, region_name)
 
-        # Two-column layout: MAP LEFT, RESULTS RIGHT ✅
         left, right = st.columns([3, 1.25], vertical_alignment="top")
 
-        # -----------------------------
-        # LEFT: Map
-        # -----------------------------
         with left:
             center_lat, center_lon = st.session_state[vkey]["center"]
             zoom_start = st.session_state[vkey]["zoom"]
@@ -417,7 +404,6 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
                 control_scale=True,
             )
 
-            # Roads display: single class, single colour (fast)
             fc_cls = roads_fc_for_geom(reg_geom, [road_class])
             roads_img = ee_fc_to_paint_image(fc_cls, color_hex="#000000", width=2).clip(reg_geom)
             roads_url = ee_tile_layer(roads_img, {})
@@ -430,7 +416,6 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
                 opacity=1.0,
             ).add_to(m2)
 
-            # Region border (green as you asked)
             outline_img = (
                 ee.Image()
                 .byte()
@@ -447,7 +432,6 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
                 opacity=1.0,
             ).add_to(m2)
 
-            # Selected road overlay in red (stored in session_state)
             if st.session_state.get(skey):
                 folium.GeoJson(
                     st.session_state[skey],
@@ -455,20 +439,15 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
                     style_function=lambda _f: {"color": "#ff0000", "weight": 6, "opacity": 1.0},
                 ).add_to(m2)
 
-            # Render map
             map_key = f"map_{road_class}_{region_name}"
             out = st_folium(m2, width=1050, height=620, key=map_key)
 
-            # Update stored view so zoom/center is preserved after reruns
             if out:
                 if out.get("center") and isinstance(out["center"], dict):
                     st.session_state[vkey]["center"] = (out["center"]["lat"], out["center"]["lng"])
                 if out.get("zoom") is not None:
                     st.session_state[vkey]["zoom"] = out["zoom"]
 
-        # -----------------------------
-        # RIGHT: Results / Info panel
-        # -----------------------------
         with right:
             st.markdown("### Selected road")
             if st.session_state.get(rkey):
@@ -489,9 +468,6 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
 """
             )
 
-        # -----------------------------
-        # Handle click (store immediately + compute stats)
-        # -----------------------------
         if not out or not out.get("last_clicked"):
             st.caption(
                 "Tip: zoom in and click close to the road. "
@@ -504,14 +480,12 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
             search_m = _adaptive_search_m(zoom_now)
 
             try:
-                # 1) Identify nearest road feature (single class)
                 nearest = nearest_road_feature(
                     reg_geom, road_class, click_lon, click_lat, search_m=search_m
                 )
                 nearest_info = nearest.getInfo() if nearest is not None else None
 
                 if not nearest_info or not nearest_info.get("properties"):
-                    # IMPORTANT: write something to the panel so it doesn't look broken
                     st.session_state[rkey] = {
                         "status": "No road found",
                         "note": f"Try zooming in and clicking closer (tolerance {search_m}m).",
@@ -528,7 +502,6 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
                             "name": props.get("name"),
                         }
                     else:
-                        # 2) Store selection geometry for red overlay
                         if nearest_info.get("geometry"):
                             st.session_state[skey] = {
                                 "type": "Feature",
@@ -540,7 +513,6 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
                                 "geometry": nearest_info["geometry"],
                             }
 
-                        # 3) Write an IMMEDIATE payload so the right panel updates instantly
                         base_payload = {
                             "status": "Selected road (computing stats...)",
                             "osm_id": osm_id,
@@ -556,7 +528,6 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
                         }
                         st.session_state[rkey] = base_payload
 
-                        # 4) Compute whole-road stats (cached) and update payload
                         stats_dict = compute_road_stats_cached(
                             region_name=region_name,
                             road_class=road_class,
@@ -588,9 +559,7 @@ for i, road_class in enumerate(TABBED_CLASSES, start=1):
                             }
 
             except Exception as e:
-                # Always show something in the panel
                 st.session_state[rkey] = {
                     "status": "Error",
                     "error": str(e),
                 }
-
