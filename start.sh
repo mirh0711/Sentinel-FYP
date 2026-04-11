@@ -76,6 +76,17 @@ _port_pid() {
     _PORT_PID=$(echo "$_LSOF_CACHE" | grep ":$1 " | awk '{print $2}' | head -1)
 }
 
+# Returns ALL pids holding the listening socket on the given port (in
+# $_PORT_PIDS). Critical for `flask run --debug`: Werkzeug spawns a reloader
+# child that inherits the listen socket, so killing only the parent leaves
+# the orphan squatting on the port and the next bind() fails with EADDRINUSE.
+_port_pids() {
+    if [ "$_LSOF_CACHE_VALID" != "true" ]; then
+        _refresh_port_cache
+    fi
+    _PORT_PIDS=$(echo "$_LSOF_CACHE" | grep ":$1 " | awk '{print $2}' | sort -u)
+}
+
 _invalidate_cache() { _LSOF_CACHE_VALID=false; }
 
 # ── Subcommand parsing ──
@@ -141,26 +152,31 @@ stop_all() {
     local stopped=0
     for entry in "${ALL_SERVICES[@]}"; do
         IFS='|' read -r name port _ _ <<< "$entry"
-        _port_pid "$port"
-        if [ -n "$_PORT_PID" ]; then
-            echo -e "  ${YELLOW}Stopping $name on :$port (pid $_PORT_PID)${NC}"
-            kill -9 "$_PORT_PID" 2>/dev/null || true
+        _port_pids "$port"
+        if [ -n "$_PORT_PIDS" ]; then
+            local pid_list=$(echo $_PORT_PIDS | tr '\n' ' ')
+            echo -e "  ${YELLOW}Stopping $name on :$port (pids ${pid_list})${NC}"
+            # Unquoted on purpose: $_PORT_PIDS may contain multiple pids
+            # (parent + Werkzeug reloader child for `flask --debug`).
+            kill -9 $_PORT_PIDS 2>/dev/null || true
             stopped=$((stopped + 1))
         else
             echo -e "  $name: not running"
         fi
     done
     if [ $stopped -gt 0 ]; then
-        sleep 1
-        # Verify
+        # Give the kernel a beat to release the listening sockets after the
+        # orphaned reloader child dies.
+        sleep 2
         _invalidate_cache
         _refresh_port_cache
         local still_up=0
         for entry in "${ALL_SERVICES[@]}"; do
             IFS='|' read -r name port _ _ <<< "$entry"
-            _port_pid "$port"
-            if [ -n "$_PORT_PID" ]; then
-                echo -e "  ${RED}$name still running on :$port${NC}"
+            _port_pids "$port"
+            if [ -n "$_PORT_PIDS" ]; then
+                local pid_list=$(echo $_PORT_PIDS | tr '\n' ' ')
+                echo -e "  ${RED}$name still running on :$port (pids ${pid_list})${NC}"
                 still_up=$((still_up + 1))
             fi
         done
@@ -223,15 +239,22 @@ for entry in "${ALL_SERVICES[@]}"; do
     name=$(echo "$name" | tr -d ' ')  # strip alignment padding
     if [ "$name" = "flask" ] && [ "$START_FLASK" != "true" ]; then continue; fi
     if [ "$name" = "next"  ] && [ "$START_NEXT"  != "true" ]; then continue; fi
-    _port_pid "$port"
-    if [ -n "$_PORT_PID" ]; then
-        echo -e "  ${YELLOW}Killing existing $name on :$port (pid $_PORT_PID)${NC}"
-        kill -9 "$_PORT_PID" 2>/dev/null || true
+    _port_pids "$port"
+    if [ -n "$_PORT_PIDS" ]; then
+        pid_list=$(echo $_PORT_PIDS | tr '\n' ' ')
+        echo -e "  ${YELLOW}Killing existing $name on :$port (pids ${pid_list})${NC}"
+        # Unquoted: $_PORT_PIDS may contain multiple pids (parent + Werkzeug
+        # reloader child for `flask --debug`). Killing only the parent leaves
+        # the orphaned child squatting on the listen socket.
+        kill -9 $_PORT_PIDS 2>/dev/null || true
         KILLED_ANY=true
     fi
 done
 if [ "$KILLED_ANY" = "true" ]; then
-    sleep 1
+    # Two seconds, not one — the orphaned reloader child needs a beat to
+    # actually die after kill -9 propagates and release the listening socket
+    # back to the kernel, otherwise the next bind() races and EADDRINUSE.
+    sleep 2
 fi
 _invalidate_cache
 
