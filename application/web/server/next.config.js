@@ -17,6 +17,9 @@ const nextConfig = {
   // HMR when the browser uses 127.0.0.1 but the dev server binds to localhost
   // (or vice versa). Whitelist both forms in dev.
   allowedDevOrigins: ['127.0.0.1', 'localhost'],
+  // Hide the Next.js dev indicator overlay (the floating "N" badge in the
+  // bottom-left of every dev page). It overlaps the workbench map controls.
+  devIndicators: false,
   async rewrites() {
     return [
       {

@@ -1,14 +1,14 @@
 'use client';
 
-// MapView is dynamic-loaded with ssr:false because Leaflet touches window at
-// module load. The map instance is held in state (not a ref) so usePolygonDraw
+// MapView is dynamic-loaded with ssr:false because MapLibre touches window at
+// module load. The MapRef instance is held in state (not a ref) so usePolygonDraw
 // re-runs when it appears. The export mutation owns its AbortController in a
 // ref because mutation.reset() only clears local state — it doesn't abort the
 // in-flight fetch.
 import dynamic from 'next/dynamic';
-import { Suspense, useState, useRef, useEffect, useCallback } from 'react';
+import { Suspense, useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import type L from 'leaflet';
+import type { MapRef } from 'react-map-gl/maplibre';
 import { useMutation } from '@tanstack/react-query';
 
 import { PageHeader } from '@/components/PageHeader';
@@ -16,9 +16,10 @@ import { RegionPicker } from '@/components/RegionPicker';
 import { TimeSlider } from '@/components/TimeSlider';
 import { ResultsPanel } from '@/components/ResultsPanel';
 import { ClassLayerLegend } from '@/components/ClassLayerLegend';
+import { StatusCard } from '@/components/StatusCard';
 
 import { useRegionInfo } from '@/hooks/useRegionInfo';
-import { useOverviewLayers } from '@/hooks/useOverviewLayers';
+import { useClassPalette } from '@/hooks/useClassPalette';
 import { useBoundaryLayer } from '@/hooks/useBoundaryLayer';
 import { usePolygonDraw } from '@/hooks/usePolygonDraw';
 
@@ -76,36 +77,59 @@ function WorkbenchInner() {
 
   const [enabled, setEnabled] = useState<Record<string, boolean>>({});
 
-  // Map instance is held in state so usePolygonDraw re-runs when it appears.
-  const [map, setMap] = useState<L.Map | null>(null);
-
-  const polygon = usePolygonDraw(map);
+  // MapRef from react-map-gl is held in state so usePolygonDraw re-runs when
+  // it appears (and when MapView remounts on palette change).
+  const [mapRef, setMapRef] = useState<MapRef | null>(null);
+  // The polygon-draw hook needs the underlying maplibregl.Map (not the
+  // react-map-gl wrapper). MapRef.getMap() returns it.
+  const maplibreMap = useMemo(() => mapRef?.getMap() ?? null, [mapRef]);
+  const polygon = usePolygonDraw(maplibreMap);
 
   const regionInfo = useRegionInfo(region);
-  const overview = useOverviewLayers(region);
+  const palette = useClassPalette();
   const boundary = useBoundaryLayer(region);
 
   const center: [number, number] = regionInfo.data?.center ?? DEFAULT_CENTER;
   const zoom = regionInfo.data ? 9 : DEFAULT_ZOOM;
 
-  // Initialise toggle defaults when new classes appear. The functional
-  // setState returns the same reference when nothing changed, so React skips
-  // the re-render even if the effect re-runs on a same-content refetch.
-  const overviewLayers = overview.data?.layers;
+  // Initialise toggle defaults when the palette arrives. Functional setState
+  // returns the same reference when nothing changed, so React skips the
+  // re-render even if the effect re-runs on a same-content refetch.
+  const paletteData = palette.data;
   useEffect(() => {
-    if (!overviewLayers) return;
+    if (!paletteData) return;
     setEnabled((prev) => {
       const next = { ...prev };
       let changed = false;
-      for (const layer of overviewLayers) {
-        if (!(layer.class in next)) {
-          next[layer.class] = true;
+      for (const fclass of paletteData.order) {
+        if (!(fclass in next)) {
+          next[fclass] = true;
           changed = true;
         }
       }
       return changed ? next : prev;
     });
-  }, [overviewLayers]);
+  }, [paletteData]);
+
+  // Region change → animated flyTo on the underlying maplibre Map. The first
+  // fire (when mapRef appears) is skipped because initialViewState already
+  // placed the map at the same target — animating from target to target is a
+  // wasted 600 ms tick on every workbench mount. essential: true means users
+  // with prefers-reduced-motion get the animation skipped automatically.
+  const flyToHasFiredRef = useRef(false);
+  useEffect(() => {
+    if (!mapRef) return;
+    if (!flyToHasFiredRef.current) {
+      flyToHasFiredRef.current = true;
+      return;
+    }
+    mapRef.getMap()?.flyTo({
+      center: [center[1], center[0]],
+      zoom,
+      duration: 600,
+      essential: true,
+    });
+  }, [mapRef, center, zoom]);
 
   const handleRegionChange = useCallback(
     (next: string) => {
@@ -218,21 +242,38 @@ function WorkbenchInner() {
               <span className="label">Map</span>
               <span className="text-slate-300">·</span>
               <span className="text-slate-600">
-                {overview.data ? `${overview.data.layers.length} class layers` : 'Loading layers…'}
+                {paletteData ? `${paletteData.order.length} class layers` : 'Loading palette…'}
               </span>
             </div>
             {regionInfo.error && (
               <span className="text-[11px] text-red-700">Region info failed: {regionInfo.error.message}</span>
             )}
           </div>
-          <MapView
-            center={center}
-            zoom={zoom}
-            overviewLayers={overview.data?.layers ?? []}
-            enabled={enabled}
-            boundary={boundary.data ?? null}
-            onMapReady={setMap}
-          />
+          {/* Gate the MapView mount on the palette being ready. The MapLibre style
+              spec is built from the palette, so the map cannot mount without it. */}
+          {palette.error ? (
+            <div className="flex-1 p-5" style={{ minHeight: 720 }}>
+              <StatusCard kind="error">
+                Could not load class palette: {palette.error.message}
+              </StatusCard>
+            </div>
+          ) : !paletteData ? (
+            <div
+              className="flex-1 grid place-items-center text-sm text-slate-400"
+              style={{ minHeight: 720 }}
+            >
+              Loading map…
+            </div>
+          ) : (
+            <MapView
+              palette={paletteData}
+              center={center}
+              zoom={zoom}
+              enabled={enabled}
+              boundary={boundary.data ?? null}
+              onMapReady={setMapRef}
+            />
+          )}
         </section>
 
         {/* RIGHT: controls + results + legend */}
@@ -309,17 +350,17 @@ function WorkbenchInner() {
             <div className="px-5 py-3 border-b border-slate-200">
               <h2 className="label">Road classes</h2>
             </div>
-            {overview.isLoading ? (
-              <div className="p-5 text-xs text-slate-400">Loading layers…</div>
-            ) : overview.error ? (
-              <div className="p-5 text-xs text-red-700">{overview.error.message}</div>
-            ) : (
+            {palette.isLoading ? (
+              <div className="p-5 text-xs text-slate-400">Loading palette…</div>
+            ) : palette.error ? (
+              <div className="p-5 text-xs text-red-700">{palette.error.message}</div>
+            ) : paletteData ? (
               <ClassLayerLegend
-                layers={overview.data?.layers ?? []}
+                palette={paletteData}
                 enabled={enabled}
                 onToggle={handleToggleClass}
               />
-            )}
+            ) : null}
           </div>
         </aside>
       </div>

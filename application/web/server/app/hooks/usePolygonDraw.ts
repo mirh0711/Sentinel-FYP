@@ -1,27 +1,21 @@
 'use client';
 
-import { useEffect, useState, useCallback, useMemo } from 'react';
-// Type-only import — types are erased at compile time, so no runtime evaluation.
-// The actual L value comes from a lazy require inside the effect (see below).
-import type L from 'leaflet';
+import { useEffect, useState, useRef, useCallback } from 'react';
+import { TerraDraw, TerraDrawPolygonMode } from 'terra-draw';
+import { TerraDrawMapLibreGLAdapter } from 'terra-draw-maplibre-gl-adapter';
+import type { Map as MaplibreMap } from 'maplibre-gl';
 
 /**
- * Polygon draw UX. React-native port of createPolygonDrawController (app.js:153-227).
+ * Polygon draw UX. Thin React wrapper around terra-draw.
  *
- * Behavior:
- * - Click on the map adds a vertex.
- * - Clicking the FIRST marker again closes the polygon.
- * - Double-clicking the map also closes (doubleClickZoom is disabled in createMap).
- * - clear() resets everything.
- * - getLngLatPolygon() returns the points in [lng, lat] order, the shape Flask expects.
+ * REGRESSION R7: cleanup MUST call BOTH `draw.off('change'/'finish', handler)`
+ * AND `draw.stop()`. Codex caught this during plan review — `draw.stop()`
+ * alone tears down the adapter but does not detach event listeners we
+ * explicitly subscribed to.
  *
- * REGRESSION R7: cleanup MUST detach every map event listener and remove every
- * Leaflet layer added to the map. Without this, switching regions or React 19
- * strict-mode double-mount leaks listeners and produces ghost markers.
- *
- * State design: a single { points, closed } object so functional setState can
- * atomically check `closed` before appending a new point. Two separate useStates
- * would race in the click handler.
+ * API SHAPE: `{isClosed, pointCount, getLngLatPolygon, clear}` — verbatim
+ * match for the old Leaflet hook so workbench/page.tsx (`polygon.pointCount`
+ * gates "Run extraction") works unchanged.
  */
 
 export interface PolygonDrawAPI {
@@ -33,103 +27,144 @@ export interface PolygonDrawAPI {
 }
 
 interface DrawState {
-  points: L.LatLng[];
+  points: Array<[number, number]>;
   closed: boolean;
 }
 
 const INITIAL_STATE: DrawState = { points: [], closed: false };
 
-export function usePolygonDraw(map: L.Map | null): PolygonDrawAPI {
+// Vertex marker styling — slate-900 to match the rest of the workbench. The
+// closingPoint (the first vertex, which doubles as the click-to-close target)
+// is slightly larger so users can find it.
+const POLYGON_STYLES = {
+  fillColor: '#0f172a',
+  fillOpacity: 0.08,
+  outlineColor: '#0f172a',
+  outlineWidth: 2,
+  closingPointColor: '#0f172a',
+  closingPointWidth: 7,
+  closingPointOutlineColor: '#ffffff',
+  closingPointOutlineWidth: 2,
+  snappingPointColor: '#0f172a',
+  snappingPointWidth: 6,
+  snappingPointOutlineColor: '#ffffff',
+  snappingPointOutlineWidth: 2,
+} as const;
+
+/**
+ * Read the current in-progress polygon's coordinate ring from the terra-draw
+ * snapshot. terra-draw stores polygons as GeoJSON Polygon features (one outer
+ * ring); we strip the closing duplicate vertex so consumers see only unique
+ * points (matching the old Leaflet behavior, which used L.LatLng[] directly).
+ */
+/**
+ * Read the in-progress polygon's coordinate ring from terra-draw. The snapshot
+ * may also contain closing-point markers; we only want the Polygon geometry,
+ * with the GeoJSON-mandatory closing-vertex duplicate stripped so pointCount
+ * matches click count.
+ */
+function readPolygonRing(draw: TerraDraw): Array<[number, number]> {
+  const features = draw.getSnapshot();
+  for (const f of features) {
+    if (f.geometry?.type === 'Polygon') {
+      const ring = f.geometry.coordinates[0] ?? [];
+      const first = ring[0];
+      const last = ring[ring.length - 1];
+      const isClosed =
+        ring.length > 1 && first !== undefined && last !== undefined &&
+        last.every((v, i) => v === first[i]);
+      const open = isClosed ? ring.slice(0, -1) : ring;
+      return open as Array<[number, number]>;
+    }
+  }
+  return [];
+}
+
+/** Reference-equality check on a coordinate ring. terra-draw fires 'change'
+ *  on non-structural events too (e.g., cursor move when snapping is enabled),
+ *  so we dedupe before triggering a React re-render. */
+function pointsEqual(a: Array<[number, number]>, b: Array<[number, number]>): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const ai = a[i];
+    const bi = b[i];
+    if (!ai || !bi || ai[0] !== bi[0] || ai[1] !== bi[1]) return false;
+  }
+  return true;
+}
+
+export function usePolygonDraw(map: MaplibreMap | null): PolygonDrawAPI {
   const [state, setState] = useState<DrawState>(INITIAL_STATE);
+  // useRef (not useState) for the TerraDraw instance: clear() reads it but no
+  // child needs to re-render when it appears. Using state would fire two extra
+  // workbench renders per MapView mount/unmount.
+  const drawRef = useRef<TerraDraw | null>(null);
 
-  // Functional updaters — stable, no captured state, so the handler effect
-  // only depends on `map`.
-  const addPoint = useCallback((latlng: L.LatLng) => {
-    setState((prev) => (prev.closed ? prev : { ...prev, points: [...prev.points, latlng] }));
-  }, []);
-
-  const close = useCallback(() => {
-    setState((prev) => (prev.closed || prev.points.length < 3 ? prev : { ...prev, closed: true }));
-  }, []);
-
-  const clear = useCallback(() => {
-    setState(INITIAL_STATE);
-  }, []);
-
-  // Attach map-level event handlers once per map instance.
   useEffect(() => {
     if (!map) return;
 
-    const handleClick = (e: L.LeafletMouseEvent) => addPoint(e.latlng);
-    const handleDblClick = (e: L.LeafletMouseEvent) => {
-      e.originalEvent.preventDefault();
-      e.originalEvent.stopPropagation();
-      close();
+    // terra-draw's start() requires the MapLibre style to be fully loaded
+    // (basemap raster + pmtiles source must be streamed in), otherwise it
+    // throws "Style is not done loading." Wait for isStyleLoaded() or 'load'.
+    let instance: TerraDraw | null = null;
+    let handleChange: () => void = () => {};
+    let handleFinish: () => void = () => {};
+    let cancelled = false;
+
+    const init = () => {
+      if (cancelled) return;
+      const adapter = new TerraDrawMapLibreGLAdapter({ map });
+      const polygonMode = new TerraDrawPolygonMode({ styles: POLYGON_STYLES });
+      const created = new TerraDraw({ adapter, modes: [polygonMode] });
+
+      handleChange = () => {
+        const points = readPolygonRing(created);
+        setState((prev) => (pointsEqual(prev.points, points) ? prev : { ...prev, points }));
+      };
+
+      handleFinish = () => {
+        const points = readPolygonRing(created);
+        setState({ points, closed: true });
+      };
+
+      created.on('change', handleChange);
+      created.on('finish', handleFinish);
+      created.start();
+      created.setMode('polygon');
+      instance = created;
+      drawRef.current = created;
     };
 
-    map.on('click', handleClick);
-    map.on('dblclick', handleDblClick);
-
-    return () => {
-      map.off('click', handleClick);
-      map.off('dblclick', handleDblClick);
-    };
-  }, [map, addPoint, close]);
-
-  // Render Leaflet layers from the current state. Effect cleanup tears down
-  // every layer it added, so each state change leaves nothing behind.
-  useEffect(() => {
-    if (!map) return;
-    // Lazy require: Leaflet touches `window` at module load and would crash
-    // Next.js prerender. workbench/page.tsx is a 'use client' file but its
-    // module body still runs during the SSR shell pass.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const L = require('leaflet') as typeof import('leaflet');
-
-    const markers: L.CircleMarker[] = [];
-    let line: L.Polyline | null = null;
-    let polygon: L.Polygon | null = null;
-
-    state.points.forEach((latlng, idx) => {
-      const marker = L.circleMarker(latlng, {
-        radius: 4,
-        color: '#dc2626',
-        fillColor: '#fff',
-        fillOpacity: 1,
-        weight: 2,
-      }).addTo(map);
-      // First marker also acts as a "close polygon" hit target.
-      if (idx === 0) marker.on('click', close);
-      markers.push(marker);
-    });
-
-    if (state.closed && state.points.length >= 3) {
-      polygon = L.polygon(state.points, {
-        color: '#dc2626',
-        weight: 1.5,
-        fillOpacity: 0.08,
-      }).addTo(map);
-    } else if (state.points.length >= 2) {
-      line = L.polyline(state.points, { color: '#dc2626', weight: 1.5 }).addTo(map);
+    if (map.isStyleLoaded()) {
+      init();
+    } else {
+      map.once('load', init);
     }
 
     return () => {
-      markers.forEach((m) => {
-        m.off();
-        map.removeLayer(m);
-      });
-      if (line) map.removeLayer(line);
-      if (polygon) map.removeLayer(polygon);
+      cancelled = true;
+      if (instance) {
+        instance.off('change', handleChange);
+        instance.off('finish', handleFinish);
+        instance.stop();
+      } else {
+        // init never ran (style still loading at unmount). Detach the
+        // pending 'load' listener so it doesn't fire after unmount.
+        map.off('load', init);
+      }
+      drawRef.current = null;
     };
-  }, [map, state, close]);
+  }, [map]);
 
-  return useMemo<PolygonDrawAPI>(
-    () => ({
-      isClosed: state.closed,
-      pointCount: state.points.length,
-      getLngLatPolygon: () => state.points.map((p) => [p.lng, p.lat] as [number, number]),
-      clear,
-    }),
-    [state, clear],
-  );
+  const clear = useCallback(() => {
+    drawRef.current?.clear();
+    setState(INITIAL_STATE);
+  }, []);
+
+  return {
+    isClosed: state.closed,
+    pointCount: state.points.length,
+    getLngLatPolygon: () => state.points.slice(),
+    clear,
+  };
 }

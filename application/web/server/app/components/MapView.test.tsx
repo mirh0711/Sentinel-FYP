@@ -1,145 +1,125 @@
 /**
- * MapView regression tests R5 and R6.
+ * MapView regression tests R5 and R6 — ported from the Leaflet implementation
+ * to react-map-gl/maplibre.
  *
- * R5: Unmounting <MapView> must call map.remove(). React 19 strict mode in dev
- *     double-mounts effects, so a missing cleanup leaks Leaflet instances.
- * R6: Mounting <MapView> under <StrictMode> must not throw
- *     "Map container is already initialized." Strict mode runs effect cleanup
- *     between the doubled mounts, so a correct cleanup makes this safe.
+ * R5: Unmounting <MapView> must call map.remove(). With react-map-gl this is
+ *     library-owned — the wrapper disposes the underlying maplibre Map on
+ *     component unmount. We assert that the unmount completes without throwing
+ *     and that the parent's onMapReady callback receives null.
+ * R6: Mounting <MapView> under <StrictMode> must not throw. The library handles
+ *     strict-mode double-mount cleanup; the test simply asserts no exception
+ *     is raised when rendering twice in a row.
  *
- * Both tests mock the leaflet module so we can verify cleanup behavior without
- * depending on Leaflet's jsdom-incompatible canvas/tile rendering. The mock
- * also enforces the "container already initialized" rule that real Leaflet
- * would enforce — that's how R6 actually exercises the constraint.
+ * The tests mock react-map-gl/maplibre, pmtiles, and maplibre-gl so we can
+ * verify behavior without depending on WebGL or jsdom-incompatible canvas.
+ * The mocks are minimal — we are NOT testing the library's internal cleanup
+ * (that's react-map-gl's job, not ours), only that our wiring doesn't break it.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, cleanup } from '@testing-library/react';
-import { StrictMode } from 'react';
+import { StrictMode, type ReactNode } from 'react';
 
-// Track which DOM elements have already been claimed by an L.map() call.
-// L.map() throws if the same container is reused without remove() being called first.
-const initializedContainers = new WeakSet<HTMLElement>();
+// Mock pmtiles to avoid evaluating its module body (which would touch
+// maplibre-gl global state).
+vi.mock('pmtiles', () => ({
+  Protocol: class {
+    tile = vi.fn();
+  },
+}));
 
-// Track calls so the assertions can inspect them
-const tracker = {
-  mapCalls: 0,
-  removeCalls: 0,
-  reset() {
-    this.mapCalls = 0;
-    this.removeCalls = 0;
+// Mock maplibre-gl to avoid loading WebGL globals into jsdom.
+vi.mock('maplibre-gl', () => ({
+  default: { addProtocol: vi.fn() },
+  addProtocol: vi.fn(),
+}));
+
+// Mock the maplibre-gl.css side-effect import in app/layout.tsx so tests
+// don't try to load a real CSS file through jsdom.
+vi.mock('maplibre-gl/dist/maplibre-gl.css', () => ({}));
+
+// Mock react-map-gl/maplibre with a Map that uses an effect to call its
+// `ref` prop with an instance on mount and `null` on unmount — this matches
+// the real library's lifecycle so R5 can assert the unmount cleanup.
+vi.mock('react-map-gl/maplibre', async () => {
+  const { useEffect } = await import('react');
+  const Map = ({
+    ref,
+    children,
+  }: {
+    ref?: (i: unknown) => void;
+    children?: ReactNode;
+  }) => {
+    useEffect(() => {
+      if (typeof ref !== 'function') return;
+      const fake = { getMap: () => null };
+      ref(fake);
+      return () => ref(null);
+    }, [ref]);
+    return <div data-testid="maplibre-map">{children}</div>;
+  };
+  const NavigationControl = () => null;
+  const Source = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  const Layer = () => null;
+  const Popup = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
+  return { Map, NavigationControl, Source, Layer, Popup };
+});
+
+import MapView from './MapView';
+import type { ClassPalette } from '@/lib/schemas/classPalette';
+
+const PALETTE: ClassPalette = {
+  order: ['residential', 'service', 'unclassified', 'tertiary', 'secondary', 'trunk', 'primary'],
+  colors: {
+    residential: '#1f77b4',
+    service: '#ff7f0e',
+    unclassified: '#d62728',
+    tertiary: '#e377c2',
+    secondary: '#2ca02c',
+    trunk: '#bcbd22',
+    primary: '#8F96A3',
   },
 };
 
-vi.mock('leaflet', () => {
-  const fakeTileLayer = () => ({
-    addTo: vi.fn().mockReturnThis(),
-    remove: vi.fn(),
-  });
-
-  const fakeMap = (el: HTMLElement) => {
-    if (initializedContainers.has(el)) {
-      throw new Error('Map container is already initialized.');
-    }
-    initializedContainers.add(el);
-    tracker.mapCalls += 1;
-
-    type Handler = (...args: unknown[]) => void;
-    const handlers = new Map<string, Set<Handler>>();
-
-    const map = {
-      _el: el,
-      setView: vi.fn().mockReturnThis(),
-      remove: vi.fn(() => {
-        tracker.removeCalls += 1;
-        initializedContainers.delete(el);
-      }),
-      addLayer: vi.fn(),
-      removeLayer: vi.fn(),
-      hasLayer: vi.fn().mockReturnValue(false),
-      on: vi.fn((event: string, fn: Handler) => {
-        if (!handlers.has(event)) handlers.set(event, new Set());
-        handlers.get(event)!.add(fn);
-      }),
-      off: vi.fn((event?: string, fn?: Handler) => {
-        if (!event) {
-          handlers.clear();
-          return;
-        }
-        if (fn) handlers.get(event)?.delete(fn);
-        else handlers.delete(event);
-      }),
-    };
-    return map;
-  };
-
-  const fakeGeoJSON = vi.fn(() => ({
-    addTo: vi.fn().mockReturnThis(),
-    remove: vi.fn(),
-  }));
-
-  const L = {
-    map: vi.fn(fakeMap),
-    tileLayer: vi.fn(fakeTileLayer),
-    geoJSON: fakeGeoJSON,
-    polyline: vi.fn(() => ({ addTo: vi.fn().mockReturnThis() })),
-    polygon: vi.fn(() => ({ addTo: vi.fn().mockReturnThis() })),
-    circleMarker: vi.fn(() => ({
-      addTo: vi.fn().mockReturnThis(),
-      on: vi.fn(),
-      off: vi.fn(),
-    })),
-  };
-  return { default: L, ...L };
-});
-
-// MapView imports './globals.css' indirectly via the lib — stub the css imports
-vi.mock('leaflet/dist/leaflet.css', () => ({}));
-
-import MapView from './MapView';
-
 describe('MapView (R5/R6)', () => {
   beforeEach(() => {
-    tracker.reset();
     cleanup();
   });
 
-  it('R5: unmounting calls map.remove()', () => {
+  it('R5: mounts, fires onMapReady with an instance, and unmounts with onMapReady(null)', () => {
     const onMapReady = vi.fn();
-    const { unmount } = render(
+    const { unmount, getByTestId } = render(
       <MapView
+        palette={PALETTE}
         center={[7.95, -1.0]}
         zoom={7}
-        overviewLayers={[]}
         enabled={{}}
         boundary={null}
         onMapReady={onMapReady}
       />,
     );
 
-    expect(tracker.mapCalls).toBe(1);
-    expect(tracker.removeCalls).toBe(0);
-    expect(onMapReady).toHaveBeenCalledTimes(1);
+    expect(getByTestId('maplibre-map')).toBeInTheDocument();
+    expect(onMapReady).toHaveBeenCalled();
+    // First call is the instance, never null on mount.
+    expect(onMapReady.mock.calls[0]?.[0]).not.toBeNull();
 
-    unmount();
+    expect(() => unmount()).not.toThrow();
 
-    expect(tracker.removeCalls).toBe(1);
-    // onMapReady is called with null on unmount
+    // Iron Rule: unmount must clear the parent's mapRef so usePolygonDraw
+    // re-mounts cleanly on next mount. Without this, switching regions twice
+    // leaks the previous map instance.
     expect(onMapReady).toHaveBeenLastCalledWith(null);
   });
 
-  it('R6: mounting under StrictMode does not throw "already initialized"', () => {
-    // StrictMode in dev runs every effect cleanup between the doubled mounts.
-    // If the cleanup is missing, the second L.map() call throws because the
-    // container is still tracked as initialized. The fact that this test
-    // doesn't throw is the assertion.
+  it('R6: mounting under StrictMode does not throw', () => {
     const onMapReady = vi.fn();
     expect(() => {
       render(
         <StrictMode>
           <MapView
+            palette={PALETTE}
             center={[7.95, -1.0]}
             zoom={7}
-            overviewLayers={[]}
             enabled={{}}
             boundary={null}
             onMapReady={onMapReady}
@@ -147,11 +127,5 @@ describe('MapView (R5/R6)', () => {
         </StrictMode>,
       );
     }).not.toThrow();
-
-    // For every L.map() call there must be a balancing remove() so the
-    // container is releasable. (StrictMode does mount → cleanup → mount, so
-    // we expect map=2, remove=1 after a successful mount.)
-    expect(tracker.mapCalls).toBeGreaterThanOrEqual(1);
-    expect(tracker.mapCalls - tracker.removeCalls).toBeLessThanOrEqual(1);
   });
 });

@@ -19,11 +19,8 @@ from shapely.geometry import Polygon, mapping
 from application import config
 from application.logic import (
     init_ee,
-    ee_tile_layer,
-    list_regions_ghana,
     region_geom_center,
     roads_fc_for_geom,
-    ee_fc_to_paint_image,
 )
 from application.logic.features import (
     adaptive_search_m,
@@ -117,47 +114,17 @@ def region_info():
         return jsonify({"error": str(exc), "status": "data_missing"}), 503
 
 
-@app.get("/api/overview_layers")
-def overview_layers():
-    """Road class overlays for a region as GeoJSON FeatureCollections.
+@app.get("/api/class_palette")
+def class_palette():
+    """Road class color palette + canonical order.
 
-    Response shape:
-        {"layers": [{"class": "trunk", "color": "#bcbd22",
-                     "geojson": <FeatureCollection>, "feature_count": N}, ...]}
-
-    Replaces the legacy GEE-tile rendering with native vector layers. Faster,
-    deterministic, no auth required. The frontend renders these via L.geoJSON.
+    Lightweight, sub-millisecond. Reads only from application.config.CLASS_COLORS via
+    local_data.class_palette() — does NOT touch the shapefile or trigger
+    region_summaries(). The workbench gates its map mount on this endpoint, so it
+    must stay fast (no shapefile load).
     """
-    region = request.args.get("region", "").strip()
-    if not region:
-        return jsonify({"error": "region is required"}), 400
-    try:
-        layers = local_data.overview_layers_for_region(region)
-        if not layers and region != "Ghana":
-            return jsonify({"error": "region not found"}), 404
-        return jsonify({"layers": layers})
-    except FileNotFoundError as exc:
-        return jsonify({"error": str(exc), "status": "data_missing"}), 503
+    return jsonify(local_data.class_palette())
 
-@app.get("/api/roads_layer")
-def roads_layer():
-    region = request.args.get("region")
-    road_class = request.args.get("class")
-
-    if region == "Ghana":
-        region_geom = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017").filter(
-            ee.Filter.eq("country_na", "Ghana")
-        ).geometry()
-    else:
-        region_geom, _ = region_geom_center(region)
-        if region_geom is None:
-            return jsonify({"error": "region not found"}), 404
-
-    classes = [road_class] if road_class else list(config.TOP10)
-    fc_cls = roads_fc_for_geom(region_geom, classes, config.ROADS_ASSET)
-    roads_img = ee_fc_to_paint_image(fc_cls, color_hex="#1f77b4", width=2).clip(region_geom)
-    roads_url = ee_tile_layer(roads_img, {})
-    return jsonify({"tile": roads_url})
 
 @app.get("/api/road_stats")
 def road_stats():

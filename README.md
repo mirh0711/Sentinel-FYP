@@ -30,7 +30,7 @@ The default `.env.example` ships with `NETINSPECT_SKIP_EE_INIT=1`, so a **fresh 
 
 | Route | Purpose |
 |---|---|
-| `/workbench` | The main map UI. Pick a region, draw a polygon, run an extraction. Renders OSM roads as colored vector layers (one per road class). The polygon-draw UX (click to add vertices, double-click or click first marker to close) is ported from the legacy vanilla JS app. |
+| `/workbench` | The main map UI. Pick a region, draw a polygon, run an extraction. Renders OSM roads as a MapLibre GL vector layer (WebGL, served from a single ~24 MB `.pmtiles` file via HTTP byte-range reads). The region picker is camera-only — it animates a `flyTo` to the selected region's center. ALL Ghana roads remain visible at all times (panning past a region's bounds shows continuous coverage). Polygon draw is `terra-draw`: click to add vertices, double-click or click first marker to close. |
 | `/regions` | Browser for the 16 Ghana administrative regions. Each card shows road km, edge count, and a class composition bar (trunk / primary / secondary / tertiary / residential / service / unclassified). Click a card → workbench preselects that region via `?region=` URL param. |
 | `/exports` | Lists past extraction runs in `NETINSPECT_OUTPUT_DIR`. Groups the three sibling files per run (network pickle / edges geojson / sentinel stats) and offers download links. |
 | `/about` | Static methodology page — data sources, pipeline overview, indices computed. |
@@ -47,7 +47,10 @@ The default `.env.example` ships with `NETINSPECT_SKIP_EE_INIT=1`, so a **fresh 
             │  - App Router pages           │
             │  - Tailwind, no UI library    │
             │  - TanStack Query             │
-            │  - Leaflet via useRef         │
+            │  - MapLibre GL via            │
+            │    react-map-gl + terra-draw  │
+            │  - PMTiles range reads from   │
+            │    public/tiles/*.pmtiles     │
             └───────────────┬───────────────┘
                             │ next.config.js rewrites:
                             │   /api/:path* → http://127.0.0.1:5050/api/:path*
@@ -55,7 +58,7 @@ The default `.env.example` ships with `NETINSPECT_SKIP_EE_INIT=1`, so a **fresh 
             ┌───────────────────────────────┐
             │  Flask (Python, port 5050)    │
             │  application/web/app.py       │
-            │  - 11 /api/* routes           │
+            │  - /api/* routes              │
             │  - reads .env via dotenv      │
             │  - graceful 503 on GEE fail   │
             └───────────────┬───────────────┘
@@ -180,12 +183,14 @@ Read endpoints (no GEE required, served from `local_data.py`):
 | Endpoint | Returns |
 |---|---|
 | `GET /api/regions` | List of 17 region names (Ghana + 16 administrative regions) |
-| `GET /api/regions/details` | Per-region road km, edge count, class composition + the canonical class palette |
+| `GET /api/regions/details` | Per-region road km, edge count, class composition (multi-second cold call — used by `/regions` page only, NOT by the workbench load gate) |
+| `GET /api/class_palette` | `{order: [...], colors: {fclass: hex}}` — sub-millisecond, no shapefile load. Used by the workbench to gate map mount. |
 | `GET /api/region_info?region=` | `{center: [lat, lng]}` |
-| `GET /api/overview_layers?region=` | Per-class GeoJSON FeatureCollections, ready for `L.geoJSON` |
 | `GET /api/boundary_layer?region=` | GeoJSON polygon (convex hull of region's roads) |
 | `GET /api/exports` | List of past extractions in `NETINSPECT_OUTPUT_DIR`, grouped by prefix |
 | `GET /api/exports/file/<name>` | Download a single export file (path-safe via `secure_filename`) |
+
+The road geometries themselves are NOT served from a JSON endpoint. They live in a single ~24 MB `application/web/server/public/tiles/ghana_roads.pmtiles` file built once via `python scripts/build_tiles.py`, served as a static file with HTTP byte-range support, and rendered by MapLibre GL JS via the `pmtiles://` protocol. See the "Rebuilding tiles" section below.
 
 Write endpoints (still GEE-bound for the Sentinel-2 part):
 
@@ -194,6 +199,19 @@ Write endpoints (still GEE-bound for the Sentinel-2 part):
 | `POST /api/export_polygon_network_s2` | Pulls drivable network via osmnx + Sentinel-2 mean indices via Earth Engine. Writes 3 files to `OUTPUT_DIR`. |
 | `GET /api/road_stats` | Per-road click-to-query stats (legacy, still GEE-bound, not used by the new workbench) |
 | `GET /api/random_road_stats` | Random road sample stats (legacy) |
+
+## Rebuilding tiles
+
+The `ghana_roads.pmtiles` file is committed to git. Rebuild it manually after the source shapefile (`data/gis_osm_roads_free_1.shp`) updates:
+
+```bash
+brew install tippecanoe        # one-time, macOS (or apt install tippecanoe on Ubuntu 24.04+)
+python scripts/build_tiles.py  # ~30 seconds, idempotent (skips if output is newer than input)
+git add application/web/server/public/tiles/ghana_roads.pmtiles
+git commit -m "data: rebuild ghana_roads.pmtiles"
+```
+
+The build is NOT wired into `setup.sh` or CI — fresh checkouts get the committed file directly. Tippecanoe is only required for the rebuild itself.
 
 ## Known TODOs
 

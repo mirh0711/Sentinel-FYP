@@ -193,3 +193,62 @@ def test_export_rejects_invalid_polygon_coordinates(client):
         "polygon": [["not", "a"], ["valid", "polygon"], [1, 2]],
     })
     assert res.status_code == 400
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/class_palette — the lightweight palette endpoint
+# Replaces the deleted /api/overview_layers as the workbench's load-time gate.
+# Must NOT touch the shapefile (no region_summaries() trigger).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_class_palette_shape(client):
+    """Returns {order: [...], colors: {...}} matching local_data.class_palette()."""
+    res = client.get("/api/class_palette")
+    assert res.status_code == 200
+    body = res.get_json()
+    assert "order" in body
+    assert "colors" in body
+    assert isinstance(body["order"], list)
+    assert isinstance(body["colors"], dict)
+    # Every class in `order` must have a color entry, and the values must be hex strings.
+    for cls in body["order"]:
+        assert cls in body["colors"]
+        assert body["colors"][cls].startswith("#")
+
+
+def test_class_palette_does_not_load_shapefile(client):
+    """Critical: this endpoint must be sub-millisecond. It is the workbench load-time
+    gate and triggering region_summaries() (multi-second cold) would defeat the
+    point of having a separate endpoint. We can't directly assert "shapefile not
+    loaded" without monkeypatching, but we can assert the call returns immediately
+    even on a fresh process by checking the response is well-formed AND the
+    `_load_roads` lru_cache hasn't been touched (cache_info().currsize == 0)."""
+    from application.web import local_data
+    # Force-clear the cache so we know we're starting fresh.
+    local_data._load_roads.cache_clear()
+    res = client.get("/api/class_palette")
+    assert res.status_code == 200
+    # The shapefile loader should NOT have been touched.
+    assert local_data._load_roads.cache_info().currsize == 0
+
+
+def test_overview_layers_route_deleted(client):
+    """The deleted /api/overview_layers endpoint must return 404."""
+    res = client.get("/api/overview_layers?region=Ghana")
+    assert res.status_code == 404
+
+
+def test_roads_layer_route_deleted(client):
+    """The deleted legacy GEE /api/roads_layer endpoint must return 404."""
+    res = client.get("/api/roads_layer?region=Ghana&class=trunk")
+    assert res.status_code == 404
+
+
+def test_overview_classes_constant_still_importable():
+    """OVERVIEW_CLASSES is still used by region_summaries — deletion of
+    overview_layers_for_region must not delete the constant."""
+    from application.web import local_data
+    assert hasattr(local_data, "OVERVIEW_CLASSES")
+    assert isinstance(local_data.OVERVIEW_CLASSES, list)
+    assert len(local_data.OVERVIEW_CLASSES) > 0

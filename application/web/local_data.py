@@ -17,7 +17,6 @@ calls are constant-time via @lru_cache.
 from __future__ import annotations
 
 import functools
-import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -155,49 +154,6 @@ def region_center(region: str) -> tuple[float, float]:
         raise ValueError(f"region not found: {region}")
     minx, miny, maxx, maxy = sub.total_bounds
     return ((miny + maxy) / 2, (minx + maxx) / 2)
-
-
-@functools.lru_cache(maxsize=32)
-def overview_layers_for_region(region: str, simplify_deg: float = 0.0003) -> tuple:
-    """Return one layer per road class as GeoJSON FeatureCollections.
-
-    Pipeline:
-      1. Slice the shapefile to the region's roads (O(n) hash filter via Series.isin).
-      2. Drop classes outside OVERVIEW_CLASSES.
-      3. Vectorised Douglas-Peucker simplification on the whole GeoSeries.
-      4. groupby('fclass') in a single pass.
-      5. Per-class geopandas .to_json() — uses fiona/pyogrio's C path, ~5-10x
-         faster than a Python dict-builder.
-
-    Returns a tuple (immutable) so the @lru_cache key is hashable. Callers
-    that need a list call list(result).
-    """
-    sub = _roads_in_region(region)
-    if sub.empty:
-        return tuple()
-
-    sub = sub[sub["fclass"].isin(OVERVIEW_CLASSES)]
-    if sub.empty:
-        return tuple()
-
-    sub = sub.assign(geometry=sub.geometry.simplify(simplify_deg, preserve_topology=True))
-
-    groups = {cls: g for cls, g in sub.groupby("fclass", sort=False)}
-    layers = []
-    for cls in OVERVIEW_CLASSES:
-        cls_rows = groups.get(cls)
-        if cls_rows is None or cls_rows.empty:
-            continue
-        # geopandas → JSON via to_json is the fast path. Drop the wide attribute
-        # set to keep payload size manageable; only keep what the popup uses.
-        gdf_slim = cls_rows[["osm_id", "name", "geometry"]]
-        layers.append({
-            "class": cls,
-            "color": CLASS_COLORS.get(cls, "#94a3b8"),
-            "geojson": json.loads(gdf_slim.to_json()),
-            "feature_count": int(len(cls_rows)),
-        })
-    return tuple(layers)
 
 
 @functools.lru_cache(maxsize=32)

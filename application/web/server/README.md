@@ -34,7 +34,7 @@ npm run test:e2e     # playwright (full stack must be running)
 
 ```
 app/
-├── layout.tsx          ← root layout, Tailwind, Providers wrapper
+├── layout.tsx          ← root layout, Tailwind, Providers wrapper, maplibre-gl CSS import
 ├── providers.tsx       ← TanStack Query client (5min default staleTime)
 ├── globals.css         ← Tailwind directives + a few utilities
 ├── page.tsx            ← redirects / → /workbench
@@ -46,15 +46,20 @@ app/
 │   └── page.tsx        ← export history
 ├── about/
 │   └── page.tsx        ← static methodology page
-├── components/         ← shared React components
-├── hooks/              ← TanStack Query wrappers + usePolygonDraw
+├── components/         ← shared React components (MapView, ClassLayerLegend, ...)
+├── hooks/              ← TanStack Query wrappers (useClassPalette, useRegionInfo, ...) + usePolygonDraw
 └── lib/
-    ├── api.ts          ← typed fetch wrapper (apiFetch + ApiError)
-    ├── format.ts       ← Intl-based formatBytes / formatDate
-    ├── leaflet.ts      ← createMap helper, basemap config
-    ├── timePoints.ts   ← 24-quarter time-slider data
-    ├── summarize.ts    ← ResultStatus → user message
-    └── schemas/        ← one Zod schema per /api/* endpoint
+    ├── api.ts             ← typed fetch wrapper (apiFetch + ApiError)
+    ├── format.ts          ← Intl-based formatBytes / formatDate
+    ├── maplibre.ts        ← pmtiles protocol registration (idempotent, side-effect import)
+    ├── maplibre-style.ts  ← buildRoadStyle(palette) — pure function, returns MapLibre style spec
+    ├── timePoints.ts      ← 24-quarter time-slider data
+    ├── summarize.ts       ← ResultStatus → user message
+    └── schemas/           ← one Zod schema per /api/* endpoint
+
+public/
+└── tiles/
+    └── ghana_roads.pmtiles  ← ~24 MB committed binary, served as pmtiles:// via Next.js static handler
 ```
 
 App Router file conventions: `app/foo/page.tsx` is `/foo`. Add a directory,
@@ -115,30 +120,44 @@ endpoints all match this shape and review will catch deviations.
 These are the things that will burn you if you don't know about them. Each
 one is locked by a regression test or a load-bearing comment in the source.
 
-### Leaflet imports
+### MapLibre + react-map-gl + pmtiles
 
-Leaflet touches `window` at module load and crashes Next.js SSR/SSG.
-Two consequences:
+MapLibre GL JS touches `window` at module load and crashes Next.js SSR/SSG.
 
 - **`MapView` MUST be loaded via `next/dynamic({ ssr: false })`.** See
   `app/workbench/page.tsx` for the pattern.
-- **Inside `usePolygonDraw`**, Leaflet is required lazily inside the
-  `useEffect` (not imported at the top of the file), because the hook is
-  imported by `workbench/page.tsx` directly and the SSR shell pass would
-  evaluate the module body otherwise. The `// eslint-disable-next-line` for
-  `no-require-imports` is there for that reason — leave it.
+- **`app/lib/maplibre.ts` registers the `pmtiles://` protocol with MapLibre at module
+  import time.** It's idempotent (HMR-safe). The `MapView` component imports it
+  for the side effect — do not move that import or the protocol won't be
+  registered when the map mounts and the road tiles will fail to load.
+- The MapLibre CSS is imported from `app/layout.tsx` (not from
+  `app/lib/maplibre.ts`). Side-effect CSS imports inside dynamic-import chains
+  don't reliably make it into the page's CSS chunk in Next.js App Router —
+  putting it at the root guarantees it's bundled.
+
+### terra-draw + style-loaded gating
+
+`terra-draw`'s `start()` requires the MapLibre style to be fully loaded. If
+you call it during the brief window where the basemap raster + pmtiles vector
+source are still streaming, it throws **"Style is not done loading."**
+`app/hooks/usePolygonDraw.ts` gates initialization on `map.isStyleLoaded()`
+(and waits for the `'load'` event otherwise) before calling `start()`. R7
+(in `app/hooks/usePolygonDraw.test.ts`) asserts the cleanup detaches both
+`change` and `finish` listeners AND calls `draw.stop()` — calling `stop()`
+alone is not proof of cleanup if you also subscribed to events.
 
 ### React 19 strict mode
 
-In dev, React 19 double-mounts effects to surface cleanup bugs. This is the
-reason for **regression tests R5/R6/R7** in `app/components/MapView.test.tsx`
-and `app/hooks/usePolygonDraw.test.ts`:
+In dev, React 19 double-mounts effects to surface cleanup bugs. With
+`react-map-gl/maplibre`, the cleanup contract for the MapLibre map instance
+itself is library-owned: the wrapper disposes the underlying `map.remove()`
+on component unmount. R5/R6 in `app/components/MapView.test.tsx` are smoke
+tests that assert mounting under `<StrictMode>` doesn't throw — they no
+longer manually verify `map.remove()` was called because that's the
+library's job.
 
-- Every Leaflet map / layer / event listener you add to a `useEffect` MUST be
-  removed in the cleanup function. Otherwise you leak Leaflet objects across
-  region switches and get "Map container is already initialized" errors.
-- The mandatory regression tests fail loudly if cleanup is missing. Don't
-  delete or skip them.
+For `usePolygonDraw`, we still own the listener subscription, so R7 still
+asserts the cleanup. Don't delete or skip these tests.
 
 ### `next.config.js` rewrites
 
@@ -170,7 +189,7 @@ ships with macOS. Don't use `wait -n`, mapfile, associative arrays, or
 
 ### CSS
 
-Leaflet's CSS is imported from `app/layout.tsx`, NOT from `app/lib/leaflet.ts`.
+MapLibre's CSS is imported from `app/layout.tsx`, NOT from `app/lib/maplibre.ts`.
 Side-effect CSS imports inside dynamic-import chains don't reliably make it
 into the page's CSS chunk in Next.js App Router — putting it at the root
 guarantees it's bundled.
@@ -179,8 +198,10 @@ guarantees it's bundled.
 
 ```
 app/components/Footer.test.tsx        smoke test (RTL + jsdom wiring)
-app/components/MapView.test.tsx       R5 + R6 (unmount cleanup, strict-mode safety)
-app/hooks/usePolygonDraw.test.ts      R7 (event listener cleanup)
+app/components/MapView.test.tsx       R5 + R6 (StrictMode mount/unmount no-throw)
+app/hooks/usePolygonDraw.test.ts      R7 (terra-draw off + stop both called on unmount)
+app/lib/maplibre-style.test.ts        buildRoadStyle pure-function unit tests
+app/lib/maplibre.test.ts              pmtiles protocol registration is idempotent
 tests/setup.ts                        @testing-library/jest-dom
 tests/e2e/rewrite-smoke.spec.ts       Playwright: hits /api/healthz via Next port,
                                       proves the rewrite is wired
@@ -201,8 +222,10 @@ auto-discovers it. To add an E2E test, drop a `.spec.ts` in `tests/e2e/`.
   `useApiQuery`. The factory enforces consistent staleTime, retry, and key
   shapes; review will catch drift.
 - **Don't hand-write color constants** — the road class palette is served by
-  `/api/regions/details` (`class_palette.colors`) and `/api/overview_layers`
-  (per-layer `color`). Front-end has zero copies.
+  the lightweight `/api/class_palette` endpoint and consumed via
+  `useClassPalette()`. Front-end has zero copies. Do NOT switch the palette
+  source to `/api/regions/details` — that triggers `region_summaries()` which
+  is multi-second cold and would gate the workbench load on a slow path.
 - **Don't add a second `.env` file** in this directory. The top-level `.env`
   is the single source of truth for both Flask and Next.js. `next.config.js`
   reads it via `dotenv` with an explicit relative path.
@@ -211,10 +234,14 @@ auto-discovers it. To add an E2E test, drop a `.spec.ts` in `tests/e2e/`.
 
 | Symptom | Likely cause | First place to look |
 |---|---|---|
-| Map renders as an empty white box | Leaflet CSS not bundled | `app/layout.tsx` should `import 'leaflet/dist/leaflet.css'` |
-| "Map container is already initialized" | useEffect cleanup missing in Leaflet code | The effect that called `L.map(...)` — must `return () => map.remove()` |
+| Map renders as an empty white box | MapLibre CSS not bundled | `app/layout.tsx` should `import 'maplibre-gl/dist/maplibre-gl.css'` |
+| Map shows basemap but no road overlay | `.pmtiles` file missing or 404 | `curl -I http://127.0.0.1:3666/tiles/ghana_roads.pmtiles` — should be 200; rebuild via `python scripts/build_tiles.py` |
+| Tiles fetch but render as `0/0/0` blank | Range requests not honored on the static handler | `curl -H "Range: bytes=0-127" http://127.0.0.1:3666/tiles/ghana_roads.pmtiles` — should be 206 with `Accept-Ranges: bytes` |
+| "Style is not done loading" runtime error | terra-draw `start()` called before MapLibre style is ready | `app/hooks/usePolygonDraw.ts` should gate on `map.isStyleLoaded()` and wait for `'load'` otherwise |
+| Map mounts but workbench shows "Loading map…" forever | `/api/class_palette` returning 404 (Flask not restarted after backend changes) or 5xx | `curl http://127.0.0.1:5050/api/class_palette` directly; if 404 the Flask process predates the new route |
 | All `/api/*` calls return CORS errors | Flask not running, or wrong port | `curl http://127.0.0.1:5050/api/healthz` directly |
 | "Failed to load regions" / 503 from `/api/regions` | Earth Engine not authenticated AND `NETINSPECT_SKIP_EE_INIT` not set | Add `NETINSPECT_SKIP_EE_INIT=1` to `.env` |
-| `npm run build` fails with "window is not defined" | Top-level Leaflet import in a non-dynamic module | Move the import inside `useEffect` as `require('leaflet')` |
+| `npm run build` fails with "window is not defined" | Top-level MapLibre import in a non-dynamic module | The component must be loaded via `next/dynamic({ ssr: false })` |
 | HMR WebSocket connection failed | Next.js 16 `allowedDevOrigins` not whitelisting your origin | `next.config.js` `allowedDevOrigins` array |
 | Workbench doesn't preselect region from `/regions` click | `useSearchParams` not wrapped in Suspense | `app/workbench/page.tsx` should export a `<Suspense>` boundary |
+| Region picker change doesn't move the map | `flyTo` `useEffect` not watching center/zoom, or `mapRef` not held in state | `app/workbench/page.tsx` — `useEffect([mapRef, center, zoom])` calls `mapRef.getMap().flyTo(...)` |

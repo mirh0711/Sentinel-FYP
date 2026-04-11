@@ -12,16 +12,21 @@ Two processes orchestrated by a single `./start.sh`:
 
 ```
 Browser → Next.js (Node, 3666) → /api/* rewrite → Flask (Python, 5050)
-                                                          │
-                                       ┌──────────────────┼──────────────────┐
-                                       ▼                  ▼                  ▼
-                              local_data.py            osmnx           earthengine-api
-                              (parquet+SHP)           (live OSM)         (optional)
+   │                                                       │
+   │ pmtiles:// range reads to                             │
+   │ /tiles/ghana_roads.pmtiles  (static, in public/)      │
+   │                                       ┌───────────────┼───────────────┐
+   │                                       ▼               ▼               ▼
+   ▼                              local_data.py        osmnx        earthengine-api
+MapLibre GL + WebGL              (parquet+SHP)       (live OSM)       (optional)
+(react-map-gl, terra-draw)
 ```
 
 The browser only ever talks to Next.js. `next.config.js` rewrites `/api/*` to Flask, so it's same-origin from the browser's perspective and there's no CORS in normal use. CORS in `app.py` is gated on `NETINSPECT_DEV=1` and only exists as a fallback for tools that bypass the rewrite (Playwright direct fetches, manual `curl` against port 5050).
 
-**The five read endpoints serve from `application/web/local_data.py`** (the Geofabrik OSM shapefile + the per-road Sentinel-2 parquet + the region lookup CSV). They run with **zero Earth Engine dependency**. Earth Engine is only required for the live `POST /api/export_polygon_network_s2` Sentinel-2 reduction step — and even that gracefully degrades to 503 with a `earth_engine_unavailable` payload via the `@app.errorhandler(EEException)` if GEE isn't authenticated.
+**The map renderer is MapLibre GL JS via `react-map-gl/maplibre`**, with vector road tiles served as a single `.pmtiles` file from `application/web/server/public/tiles/`. The browser does HTTP byte-range reads against the pmtiles file (Next.js's static handler returns 206 with `Accept-Ranges`/`Content-Range`, verified for both `next dev` and `next start`). Polygon drawing is `terra-draw` + the MapLibre adapter, hand-rolled UX is gone.
+
+**The read endpoints serve from `application/web/local_data.py`** (the Geofabrik OSM shapefile + the per-road Sentinel-2 parquet + the region lookup CSV). They run with **zero Earth Engine dependency**. Earth Engine is only required for the live `POST /api/export_polygon_network_s2` Sentinel-2 reduction step — and even that gracefully degrades to 503 with a `earth_engine_unavailable` payload via the `@app.errorhandler(EEException)` if GEE isn't authenticated.
 
 **The backend stays Flask.** Do not propose moving `/api/*` routes into Next.js API routes. The data layer is `geopandas`, `osmnx`, `igraph`, and `earthengine-api` — all Python-only with no Node equivalents. This is a hard constraint, not a preference.
 
@@ -86,15 +91,30 @@ require('dotenv').config({ path: path.join(__dirname, '../../../.env') });
 
 Do not commit a second `.env.example` inside `application/web/server/`. The drift risk between two .env files is real (caught by outside-voice review during the v2 plan).
 
-### React 19 strict mode + Leaflet
-Leaflet uses `window` at module load and crashes Next.js SSR. Any component that imports Leaflet must be loaded via `next/dynamic` with `{ ssr: false }`:
+### React 19 strict mode + MapLibre
+MapLibre GL JS uses `window` at module load and crashes Next.js SSR. The `MapView` component must be loaded via `next/dynamic` with `{ ssr: false }`:
 
 ```typescript
 import dynamic from 'next/dynamic';
 const MapView = dynamic(() => import('@/components/MapView'), { ssr: false });
 ```
 
-React 19 strict mode double-mounts effects in dev. Calling `L.map(container)` twice on the same DOM node throws "Map container is already initialized." Every Leaflet `useEffect` MUST return a cleanup that calls `map.remove()`. Mandatory regression tests R5/R6/R7 lock this.
+`react-map-gl/maplibre` owns the cleanup contract for the MapLibre map instance — it disposes the underlying `map.remove()` on component unmount, and StrictMode double-mount is safe by default. We do NOT manually wire any `useEffect` that creates the map; that's the whole point of using the React wrapper. R5/R6 (in `app/components/MapView.test.tsx`) are smoke tests that assert the wrapper renders cleanly under StrictMode without throwing.
+
+### terra-draw + style-loaded gating
+`terra-draw`'s `start()` requires the MapLibre style to be fully loaded. If you call it during the brief window where the basemap raster + pmtiles vector source are still streaming, it throws **"Style is not done loading"**. `usePolygonDraw` gates initialization on `map.isStyleLoaded()` (and waits for the `'load'` event otherwise) before calling `start()`. R7 (in `app/hooks/usePolygonDraw.test.ts`) asserts both `draw.off('change'/'finish')` AND `draw.stop()` are called on cleanup — calling `stop()` alone is not proof of cleanup if you also subscribed to events.
+
+### pmtiles protocol registration
+The PMTiles JS library exposes a `Protocol` class that bridges `pmtiles://` URLs in the MapLibre style spec to HTTP byte-range reads against a static file. We register it globally in `app/lib/maplibre.ts` with an idempotent guard so HMR re-imports are safe. The `MapView` imports `maplibre.ts` for the side effect — do not move that import or the protocol won't be registered when the map mounts.
+
+### `/api/class_palette` is the lightweight palette endpoint
+The workbench gates its `<MapView>` mount on `useClassPalette()` resolving (the MapLibre style spec needs the road class colors before it can be built). That endpoint is intentionally separate from `/api/regions/details` because the latter triggers `region_summaries()` which is documented as a multi-second cold call (TODOS.md). `/api/class_palette` reads only the dict literal from `application/config.py:CLASS_COLORS` and is sub-millisecond cold and warm. **Never gate UI mounts on `/api/regions/details`.** Codex caught this during the rebuild plan review.
+
+### Region picker is camera-only in the workbench
+After the v2.5 map rebuild, the workbench loads the single Ghana `.pmtiles` containing all 95k+ road features. The region picker no longer filters which roads are visible — it calls `mapRef.flyTo({center, zoom, duration: 600})` to recenter the camera. ALL roads remain visible at all times. Side benefit: fixes a bug where panning past a region's convex hull produced an empty map. The `/regions` page still works as a per-region browser via the unchanged `/api/regions/details` endpoint.
+
+### Vector tiles live in `public/tiles/` and are committed to git
+`application/web/server/public/tiles/ghana_roads.pmtiles` is a ~24 MB binary built once via `python scripts/build_tiles.py` and committed to git (consistent with `data/`, which is also committed). Tippecanoe is NOT a `setup.sh` prerequisite — it's only needed when rebuilding the tile after a shapefile update. To rebuild: `brew install tippecanoe && python scripts/build_tiles.py && git add application/web/server/public/tiles/`.
 
 ### `next.config.js` rewrites use `127.0.0.1`, not `localhost`
 Intentional. macOS resolves `localhost` to both `::1` and `127.0.0.1`, and Node's HTTP client picks IPv6 first. Flask binds IPv4 by default. Using `127.0.0.1` everywhere avoids the dual-stack mismatch.
@@ -112,6 +132,8 @@ macOS ships bash 3.2 by default. Do not use `wait -n`, mapfile, associative arra
 ├── setup.sh / start.sh          # bootstrap + dev orchestrator (top-level)
 ├── .env.example                 # single source for both Flask and Next.js
 ├── requirements.txt             # Python deps (Flask, GEE, geopandas, osmnx, ...)
+├── scripts/
+│   └── build_tiles.py           # one-shot: shapefile → tippecanoe → ghana_roads.pmtiles
 ├── application/
 │   ├── config.py                # env-driven constants (CLASS_COLORS, TOP10, EE_PROJECT)
 │   ├── logic/                   # legacy GEE + geospatial logic (still used by export endpoint)
@@ -127,9 +149,12 @@ macOS ships bash 3.2 by default. Do not use `wait -n`, mapfile, associative arra
 │           │   ├── regions/     # region browser (uses /api/regions/details)
 │           │   ├── exports/     # export history (uses /api/exports)
 │           │   ├── about/       # static methodology
-│           │   ├── components/  # Nav, MapView, ResultsPanel, SummaryStrip, StatusCard, ...
-│           │   ├── hooks/       # useApiQuery factory + 5 endpoint wrappers + usePolygonDraw
-│           │   └── lib/         # api.ts, format.ts, leaflet.ts, schemas/
+│           │   ├── components/  # Nav, MapView (react-map-gl), ResultsPanel, ...
+│           │   ├── hooks/       # useApiQuery factory + endpoint wrappers + usePolygonDraw
+│           │   └── lib/         # api.ts, format.ts, maplibre.ts, maplibre-style.ts, schemas/
+│           ├── public/
+│           │   └── tiles/
+│           │       └── ghana_roads.pmtiles  # ~24 MB committed binary, served as pmtiles://
 │           └── tests/           # vitest unit + Playwright E2E
 ├── tests/                       # pytest backend suite (R1-R4 regressions + happy paths)
 ├── notebooks/                   # standalone Jupyter analysis (NOT part of the web app)
@@ -147,7 +172,7 @@ The legacy vanilla JS frontend (`application/web/static/` and `templates/`) was 
 
 - Every loader is `@functools.lru_cache(maxsize=1)` and reads its data once on first call. Memory cost is bounded but real (~800 MB resident after warm-up).
 - Every public function that returns user-visible data is also `@lru_cache`d, keyed on its arguments. Cold calls are 1-3 seconds; warm calls are microseconds.
-- The road class palette is defined in `application/config.py:CLASS_COLORS`. `local_data.class_palette()` exposes it via `/api/regions/details` so the frontend has zero copies.
+- The road class palette is defined in `application/config.py:CLASS_COLORS`. `local_data.class_palette()` exposes it via the lightweight `/api/class_palette` endpoint (sub-millisecond, no shapefile load) so the frontend has zero copies. Do NOT gate UI mounts on `/api/regions/details` — that triggers `region_summaries()` which is multi-second cold.
 - `output_dir()` is a function, not a constant (see the OUTPUT_DIR gotcha above).
 - If you add new fields to `region_summaries()` or similar, also add them to the matching Zod schema in `application/web/server/app/lib/schemas/`.
 

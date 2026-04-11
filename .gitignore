@@ -41,3 +41,7 @@ playwright-report/
 test-results/
 coverage/
 /.claude/skills/pptx
+.gstack/
+
+# Tippecanoe SQLite WAL leftover (the .pmtiles file itself IS committed)
+*.pmtiles-journal

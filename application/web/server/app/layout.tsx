@@ -1,9 +1,10 @@
 import type { Metadata } from 'next';
 import './globals.css';
-// Leaflet CSS at the root layout: dynamic-import chains don't reliably pull
-// node_modules CSS into the page's CSS chunk, so the .leaflet-container styles
-// would be missing and the map would render as an invisible div.
-import 'leaflet/dist/leaflet.css';
+// MapLibre CSS at the root layout: dynamic-import chains don't reliably pull
+// node_modules CSS into the page's CSS chunk, so the .maplibregl-map and
+// .maplibregl-popup-content styles would be missing and the map would render
+// as an invisible div.
+import 'maplibre-gl/dist/maplibre-gl.css';
 import { Providers } from './providers';
 import { Nav } from './components/Nav';
 import { Footer } from './components/Footer';

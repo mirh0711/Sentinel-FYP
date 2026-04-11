@@ -1,173 +1,202 @@
 'use client';
 
 /**
- * MapView — vanilla Leaflet inside a useRef + useEffect.
+ * MapView — declarative MapLibre via react-map-gl/maplibre.
  *
- * MUST be loaded via next/dynamic with { ssr: false } because Leaflet touches
+ * MUST be loaded via next/dynamic with { ssr: false } because MapLibre touches
  * `window` at module load and crashes Next.js SSR/SSG.
  *
- * REGRESSION R5/R6: cleanup MUST call map.remove() to satisfy React 19 strict
- * mode's double-mount of effects in dev. Without this, mounting the workbench
- * twice produces "Map container is already initialized."
+ * REGRESSION R5/R6: react-map-gl owns the cleanup contract for the MapLibre map
+ * instance. Mounting under <StrictMode> is safe by default; the library
+ * disposes the underlying map.remove() on unmount. We do NOT manually wire any
+ * useEffect that creates the map — that's the whole point of using the React
+ * wrapper instead of vanilla MapLibre.
+ *
+ * The boundary outline source/layer is added via <Source>+<Layer>, NOT in
+ * buildRoadStyle, because the boundary GeoJSON changes per-region while the
+ * style spec is built once per palette.
+ *
+ * The flyTo for region change happens in workbench/page.tsx (where the
+ * mapRef is held) — see the useEffect there that watches center/zoom and
+ * calls mapRef.current?.flyTo({...}).
  */
-import { useEffect, useRef } from 'react';
-import L from 'leaflet';
-import { createMap } from '@/lib/leaflet';
-import type { OverviewLayer } from '@/lib/schemas/overviewLayers';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import {
+  Map as MapLibreMap,
+  Source,
+  Layer,
+  Popup,
+  NavigationControl,
+} from 'react-map-gl/maplibre';
+import type { MapMouseEvent, MapRef } from 'react-map-gl/maplibre';
+
+import { buildRoadStyle, allRoadLayerIds, roadLayerId, FALLBACK_ROAD_COLOR } from '@/lib/maplibre-style';
+// Side-effect import: registers the pmtiles:// protocol with maplibre BEFORE
+// the <Map> mounts. Idempotent under HMR.
+import '@/lib/maplibre';
+import type { ClassPalette } from '@/lib/schemas/classPalette';
 import type { BoundaryLayer } from '@/lib/schemas/boundaryLayer';
 
 export interface MapViewProps {
+  palette: ClassPalette;
   center: [number, number];
   zoom: number;
-  overviewLayers: OverviewLayer[];
   enabled: Record<string, boolean>;
   boundary: BoundaryLayer | null;
-  /** Receives the Leaflet map instance after init, and null on unmount. */
-  onMapReady: (map: L.Map | null) => void;
+  /** Receives the maplibre Map instance for region-change flyTo from the parent. */
+  onMapReady: (map: MapRef | null) => void;
 }
 
-// Line widths per OSM road class. Trunk visible at all zooms, residential thin.
-// Could come from the backend alongside `color` if we want a single source of
-// truth — for now this is the only place line widths exist.
-const WIDTHS: Record<string, number> = {
-  trunk: 3,
-  trunk_link: 2,
-  primary: 2.5,
-  primary_link: 2,
-  secondary: 2,
-  secondary_link: 1.5,
-  tertiary: 1.5,
-  tertiary_link: 1.2,
-  residential: 1,
-  service: 1,
-  unclassified: 1,
-};
-
-function buildPopup(name: string, fclass: string, color: string): HTMLDivElement {
-  // DOM node, not innerHTML — auto-escapes any user-supplied OSM road name.
-  const div = document.createElement('div');
-  div.style.cssText = 'font-family:Inter,system-ui,sans-serif;font-size:11px;color:#334155';
-  const strong = document.createElement('b');
-  strong.style.color = '#0f172a';
-  strong.textContent = name;
-  div.appendChild(strong);
-  div.appendChild(document.createElement('br'));
-  const dot = document.createElement('span');
-  dot.style.color = color;
-  dot.textContent = '● ';
-  div.appendChild(dot);
-  div.appendChild(document.createTextNode(fclass));
-  return div;
+interface ClickedRoad {
+  lng: number;
+  lat: number;
+  name: string;
+  fclass: string;
+  color: string;
 }
 
-function isLayerVisible(enabled: Record<string, boolean>, cls: string): boolean {
-  // Single source of truth for "is this class enabled?". Default to visible
-  // when the user hasn't toggled the class. Mirrors ClassLayerLegend's default.
-  return enabled[cls] !== false;
-}
+const BOUNDARY_SOURCE_ID = 'boundary-source';
+const BOUNDARY_LAYER_ID = 'boundary-layer';
+
+const EMPTY_FC = { type: 'FeatureCollection' as const, features: [] };
 
 export default function MapView({
+  palette,
   center,
   zoom,
-  overviewLayers,
   enabled,
   boundary,
   onMapReady,
 }: MapViewProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const mapRef = useRef<L.Map | null>(null);
-  const layerRegistryRef = useRef<Map<string, L.GeoJSON>>(new Map());
-  const boundaryRef = useRef<L.GeoJSON | null>(null);
-  const lastBoundaryDataRef = useRef<BoundaryLayer | null>(null);
+  const style = useMemo(() => buildRoadStyle(palette), [palette]);
+  const interactiveLayerIds = useMemo(() => allRoadLayerIds(palette), [palette]);
+  const [clicked, setClicked] = useState<ClickedRoad | null>(null);
 
+  // initialViewState is one-shot; subsequent moves go through flyTo() in the
+  // parent. Lazy-init via useState so center/zoom prop changes don't recompute.
+  const [initialViewState] = useState(() => ({
+    longitude: center[1],
+    latitude: center[0],
+    zoom,
+  }));
+
+  const handleClick = useCallback(
+    (e: MapMouseEvent) => {
+      const features = e.features ?? [];
+      if (features.length === 0) {
+        setClicked(null);
+        return;
+      }
+      const f = features[0];
+      if (!f) return;
+      const props = (f.properties ?? {}) as { name?: string | null; fclass?: string };
+      const fclass = props.fclass ?? '';
+      const name = props.name && props.name.trim() ? props.name : '(unnamed)';
+      const color = palette.colors[fclass] ?? FALLBACK_ROAD_COLOR;
+      setClicked({ lng: e.lngLat.lng, lat: e.lngLat.lat, name, fclass, color });
+    },
+    [palette],
+  );
+
+  // Local ref so the visibility-toggle effect can call setLayoutProperty on
+  // the underlying maplibre map. The parent gets the same instance via
+  // onMapReady for region-change flyTo.
+  const localMapRef = useRef<MapRef | null>(null);
+  const handleRefChange = useCallback(
+    (instance: MapRef | null) => {
+      localMapRef.current = instance;
+      onMapReady(instance);
+    },
+    [onMapReady],
+  );
+
+  // Toggle road layer visibility via the imperative MapLibre API. Road layers
+  // come from the baked-in style spec (with the right colors on first paint);
+  // we override visibility here per the react-map-gl pattern for runtime
+  // toggling of style-spec layers.
   useEffect(() => {
-    if (!containerRef.current) return;
-    const map = createMap(containerRef.current, center, zoom);
-    mapRef.current = map;
-    onMapReady(map);
-
-    return () => {
-      onMapReady(null);
-      map.remove();
-      mapRef.current = null;
-      layerRegistryRef.current.clear();
-      boundaryRef.current = null;
-      lastBoundaryDataRef.current = null;
+    const map = localMapRef.current?.getMap();
+    if (!map) return;
+    const apply = () => {
+      for (const fclass of palette.order) {
+        const id = roadLayerId(fclass);
+        if (!map.getLayer(id)) continue;
+        const visible = enabled[fclass] !== false;
+        map.setLayoutProperty(id, 'visibility', visible ? 'visible' : 'none');
+      }
     };
-  }, []);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    const registry = layerRegistryRef.current;
-
-    const incomingClasses = new Set(overviewLayers.map((l) => l.class));
-
-    for (const [cls, layer] of registry.entries()) {
-      if (!incomingClasses.has(cls)) {
-        if (map.hasLayer(layer)) map.removeLayer(layer);
-        registry.delete(cls);
-      }
+    if (map.isStyleLoaded()) {
+      apply();
+      return;
     }
+    // Style still loading: defer until ready, and clean up the listener if
+    // this effect re-runs or the component unmounts before the event fires.
+    map.once('styledata', apply);
+    return () => {
+      map.off('styledata', apply);
+    };
+  }, [enabled, palette]);
 
-    for (const layerInfo of overviewLayers) {
-      let geo = registry.get(layerInfo.class);
-      if (!geo) {
-        const weight = WIDTHS[layerInfo.class] ?? 1;
-        geo = L.geoJSON(layerInfo.geojson as GeoJSON.FeatureCollection, {
-          style: {
-            color: layerInfo.color,
-            weight,
-            opacity: 0.85,
-            lineCap: 'round',
-          },
-          onEachFeature: (feature, lyr) => {
-            const props = (feature.properties ?? {}) as { name?: string | null; fclass?: string };
-            const name = props.name && props.name.trim() ? props.name : '(unnamed)';
-            const cls = props.fclass ?? layerInfo.class;
-            lyr.bindPopup(() => buildPopup(name, cls, layerInfo.color));
-          },
-        });
-        registry.set(layerInfo.class, geo);
-      }
-      const shouldBeOn = isLayerVisible(enabled, layerInfo.class);
-      const isOn = map.hasLayer(geo);
-      if (shouldBeOn && !isOn) geo.addTo(map);
-      if (!shouldBeOn && isOn) map.removeLayer(geo);
-    }
-  }, [overviewLayers, enabled]);
+  return (
+    <div className="flex-1" style={{ minHeight: 720, position: 'relative' }}>
+      <MapLibreMap
+        ref={handleRefChange}
+        initialViewState={initialViewState}
+        mapStyle={style}
+        style={{ width: '100%', height: '100%' }}
+        interactiveLayerIds={interactiveLayerIds}
+        onClick={handleClick}
+        // dblclick is consumed by terra-draw to close the polygon. Disable
+        // the default double-click-to-zoom so it doesn't fight the draw UX.
+        doubleClickZoom={false}
+      >
+        <NavigationControl position="top-left" />
 
-  // Boundary outline. Skip the rebuild if the data reference hasn't changed
-  // (TanStack Query refetches with identical content still produce a fresh
-  // wrapper, so we compare the last-rendered ref).
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    if (boundary === lastBoundaryDataRef.current) return;
-    lastBoundaryDataRef.current = boundary;
+        {/* Boundary outline — separate source/layer because boundary changes per-region. */}
+        <Source
+          id={BOUNDARY_SOURCE_ID}
+          type="geojson"
+          data={(boundary?.geojson as GeoJSON.FeatureCollection | undefined) ?? EMPTY_FC}
+        >
+          <Layer
+            id={BOUNDARY_LAYER_ID}
+            type="line"
+            source={BOUNDARY_SOURCE_ID}
+            paint={{
+              'line-color': '#0f172a',
+              'line-width': 1.5,
+              'line-opacity': 0.9,
+              'line-dasharray': [4, 4],
+            }}
+          />
+        </Source>
 
-    if (boundaryRef.current) {
-      map.removeLayer(boundaryRef.current);
-      boundaryRef.current = null;
-    }
-    if (boundary) {
-      boundaryRef.current = L.geoJSON(boundary.geojson as GeoJSON.FeatureCollection, {
-        style: {
-          color: '#0f172a',
-          weight: 1.5,
-          opacity: 0.9,
-          fillOpacity: 0,
-          dashArray: '4 4',
-        },
-      }).addTo(map);
-    }
-  }, [boundary]);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    map.setView(center, zoom);
-  }, [center, zoom]);
-
-  return <div ref={containerRef} className="flex-1" style={{ minHeight: 720 }} />;
+        {clicked && (
+          <Popup
+            longitude={clicked.lng}
+            latitude={clicked.lat}
+            anchor="top"
+            closeButton={false}
+            closeOnClick={true}
+            onClose={() => setClicked(null)}
+            className="netinspect-road-popup"
+          >
+            <div
+              style={{
+                fontFamily: 'Inter, system-ui, sans-serif',
+                fontSize: 11,
+                color: '#334155',
+                lineHeight: 1.2,
+              }}
+            >
+              <b style={{ color: '#0f172a' }}>{clicked.name}</b>
+              <br />
+              <span style={{ color: clicked.color }}>● </span>
+              {clicked.fclass}
+            </div>
+          </Popup>
+        )}
+      </MapLibreMap>
+    </div>
+  );
 }
